@@ -1,0 +1,535 @@
+# Script3
+# Penalized logistic regression using elastic net frameworks
+# Purpose:  Identify clinical data and flow cytometric quantification variables (from supervised and unsupervised analysis) #linked to with platelet-associated HIV RNA detection. 
+#
+# Input:    XLXS file with columns:
+# - HIV_IN_PLATELETS: grouping factor (positive versus negative for platelet-associated HIV RNA)
+# - STATUS: grouping factor (responder and non-responders)
+
+# 0. Load packages
+
+library(tidyverse)
+library(glmnet)
+library(pROC)
+library(patchwork)
+
+# 1. Load data
+
+df <- read_excel(“data.xlsx")
+
+df <- df %>%
+  mutate(
+    HIV_IN_PLATELETS_bin = case_when(
+      HIV_IN_PLATELETS %in% c("positive", "Positive", "POS", "+") ~ 1,
+      HIV_IN_PLATELETS %in% c("negative", "Negative", "NEG", "-") ~ 0,
+      TRUE ~ NA_real_
+    ),
+    STATUS_bin = case_when(
+      STATUS %in% c("InR", "INR", "non-responder") ~ 1,
+      STATUS %in% c("IR", "responder") ~ 0,
+      TRUE ~ NA_real_
+    ),
+    SEX = factor(SEX)
+  )
+
+# 2. Predictor selection
+
+# UMAP/FlowSOM-focused model
+# Avoid redundancy with classical FACS variables
+
+predictors_umap_hiv <- c("STATUS",
+                         "SEX",
+                         "AGE",
+                         "CLINICAL_LYMPHOCYTES_per_ul",
+                         "CLINICAL_CD4_per_ul",
+                         "CLINICAL_CD8_per_ul",
+                         "CLINICAL_CD4_CD8_ratio",
+                         "CLINICAL_PLATELETS_per_ul",
+                         #"HIV_IN_PLATELETS",
+                         "FACS_CD4_RTE",
+                         "FACS_CD4_RTE_conjugatePT",
+                         "FACS_CD4",
+                         "FACS_CD4_conjugatePT",
+                         "FACS_CD8",
+                         "FACS_CD8_conjugatePT",
+                         "FACS_DN",
+                         "FACS_DN_conjugatePT",
+                         "UMAP_CD4effector_freq",
+                         "UMAP_CD4effector_conjugate",
+                         "UMAP_CD4memory_freq",
+                         "UMAP_CD4memory_conjugate",
+                         "UMAP_CD8effector_freq",
+                         "UMAP_CD8effector_conjugate",
+                         "UMAP_CD8memory_freq",
+                         "UMAP_CD8memory_conjugate",
+                         "UMAP_CD4naive_freq",
+                         "UMAP_CD4naive_conjugate",
+                         "UMAP_CD8naive_freq",
+                         "UMAP_CD8naive_conjugate"
+)
+
+
+# 3. Prepare dataset
+
+dat_umap <- df %>%
+  select(
+    HIV_IN_PLATELETS_bin,
+    all_of(predictors_umap_hiv)
+  ) %>%
+  drop_na(HIV_IN_PLATELETS_bin)
+
+# Check for collinearity
+
+# Select only numeric predictors
+numeric_preds <- dat_umap %>%
+  select(all_of(predictors_umap_hiv)) %>%
+  select(where(is.numeric))
+
+# Calculate correlation matrix (handling NAs)
+cor_matrix <- cor(numeric_preds, use = "complete.obs")
+
+# Function to identify variables to remove based on correlation threshold
+remove_collinear <- function(cor_matrix, threshold = 0.8) {
+  n <- ncol(cor_matrix)
+  to_remove <- character(0)
+  
+  for(i in 1:(n-1)) {
+    for(j in (i+1):n) {
+      if(abs(cor_matrix[i, j]) > threshold) {
+        var1 <- rownames(cor_matrix)[i]
+        var2 <- colnames(cor_matrix)[j]
+        
+        # Keep the first variable, remove the second if not already removed
+        if(!(var2 %in% to_remove)) {
+          to_remove <- c(to_remove, var2)
+        }
+      }
+    }
+  }
+  return(to_remove)
+}
+
+# Identify collinear variables (|r| > 0.8)
+vars_to_remove <- remove_collinear(cor_matrix, threshold = 0.8)
+print(paste("Variables to remove due to collinearity:", paste(vars_to_remove, collapse = ", ")))
+
+predictors_umap_hiv <- c("STATUS",
+                         "SEX",
+                         "AGE",
+                         "CLINICAL_LYMPHOCYTES_per_ul",
+                         "CLINICAL_CD4_per_ul",
+                         "CLINICAL_CD8_per_ul",
+                         "CLINICAL_CD4_CD8_ratio",
+                         "CLINICAL_PLATELETS_per_ul",
+                         #"HIV_IN_PLATELETS",
+                         "FACS_CD4_RTE",
+                         "FACS_CD4_RTE_conjugatePT",
+                         "FACS_CD4",
+                         #"FACS_CD4_conjugatePT",
+                         #"FACS_CD8",
+                         "FACS_CD8_conjugatePT",
+                         "FACS_DN",
+                         "FACS_DN_conjugatePT",8
+                         "UMAP_CD4effector_freq",
+                         "UMAP_CD4effector_conjugate",
+                         "UMAP_CD4memory_freq",
+                         "UMAP_CD4memory_conjugate",
+                         "UMAP_CD8effector_freq",
+                         "UMAP_CD8effector_conjugate",
+                         "UMAP_CD8memory_freq",
+                         #"UMAP_CD8memory_conjugate",
+                         "UMAP_CD4naive_freq",
+                         "UMAP_CD4naive_conjugate",
+                         "UMAP_CD8naive_freq"
+                         #"UMAP_CD8naive_conjugate"
+)
+
+
+
+# 4. Imputation
+
+dat_umap <- dat_umap %>%
+  mutate(
+    across(
+      where(is.numeric),
+      ~ ifelse(
+        is.na(.x),
+        median(.x, na.rm = TRUE),
+        .x
+      )
+    )
+  )
+
+# 5. Build design matrix
+
+formula_umap <- as.formula(
+  paste(
+    "HIV_IN_PLATELETS_bin ~",
+    paste(
+      predictors_umap_hiv,
+      collapse = " + "
+    )
+  )
+)
+
+x_umap <- model.matrix(
+  formula_umap,
+  data = dat_umap
+)[, -1, drop = FALSE]
+
+y_umap <- dat_umap$HIV_IN_PLATELETS_bin
+
+# 6. Elastic net tuning
+
+set.seed(123)
+
+alpha_grid <- c(0.25, 0.5, 0.75, 1)
+
+cv_list_umap <- list()
+
+for(a in alpha_grid){
+  
+  cv_list_umap[[paste0("alpha_", a)]] <- cv.glmnet(
+    x = x_umap,
+    y = y_umap,
+    family = "binomial",
+    alpha = a,
+    nfolds = 5,
+    type.measure = "deviance",
+    standardize = TRUE
+  )
+}
+
+# 7. Select best alpha
+
+cv_summary_umap <- tibble(
+  alpha = alpha_grid,
+  cvm_min = sapply(
+    cv_list_umap,
+    function(z) min(z$cvm)
+  ),
+  lambda_min = sapply(
+    cv_list_umap,
+    function(z) z$lambda.min
+  ),
+  lambda_1se = sapply(
+    cv_list_umap,
+    function(z) z$lambda.1se
+  )
+)
+
+print(cv_summary_umap)
+
+best_alpha_umap <- cv_summary_umap$alpha[
+  which.min(cv_summary_umap$cvm_min)
+]
+
+best_fit_umap <- cv_list_umap[[paste0("alpha_", best_alpha_umap)]]
+
+cat("Best alpha:", best_alpha_umap, "\n")
+
+
+# 8. Extract selected variables
+
+
+coef_mat_umap <- as.matrix(
+  coef(
+    best_fit_umap,
+    s = "lambda.1se"
+  )
+)
+
+coef_table_umap <- tibble(
+  variable = rownames(coef_mat_umap),
+  coefficient = as.numeric(
+    coef_mat_umap[,1]
+  )
+) %>%
+  filter(variable != "(Intercept)") %>%
+  arrange(desc(abs(coefficient)))
+
+selected_umap <- coef_table_umap %>%
+  filter(coefficient != 0)
+
+print(selected_umap)
+
+
+# 9. Apparent AUC
+
+
+pred_umap <- predict(
+  best_fit_umap,
+  newx = x_umap,
+  s = "lambda.1se",
+  type = "response"
+)
+
+auc_umap <- auc(
+  roc(
+    y_umap,
+    as.numeric(pred_umap),
+    quiet = TRUE
+  )
+)
+
+cat(
+  "Apparent AUC =",
+  round(as.numeric(auc_umap), 3),
+  "\n"
+)
+
+
+# 10. Repeated cross-validated AUC
+
+
+set.seed(123)
+
+n_repeats <- 100
+k <- 5
+
+auc_values_umap <- c()
+
+for(r in 1:n_repeats){
+  
+  fold_id <- sample(
+    rep(
+      1:k,
+      length.out = nrow(x_umap)
+    )
+  )
+  
+  fold_auc <- c()
+  
+  for(f in 1:k){
+    
+    train_idx <- which(fold_id != f)
+    test_idx  <- which(fold_id == f)
+    
+    x_train <- x_umap[train_idx, , drop = FALSE]
+    y_train <- y_umap[train_idx]
+    
+    x_test <- x_umap[test_idx, , drop = FALSE]
+    y_test <- y_umap[test_idx]
+    
+    if(length(unique(y_train)) < 2) next
+    if(length(unique(y_test)) < 2) next
+    
+    cvfit <- cv.glmnet(
+      x_train,
+      y_train,
+      family = "binomial",
+      alpha = best_alpha_umap,
+      nfolds = 5,
+      standardize = TRUE
+    )
+    
+    pred <- predict(
+      cvfit,
+      newx = x_test,
+      s = "lambda.1se",
+      type = "response"
+    )
+    
+    roc_obj <- roc(
+      y_test,
+      as.numeric(pred),
+      quiet = TRUE
+    )
+    
+    fold_auc <- c(
+      fold_auc,
+      as.numeric(auc(roc_obj))
+    )
+  }
+  
+  auc_values_umap <- c(
+    auc_values_umap,
+    mean(fold_auc, na.rm = TRUE)
+  )
+}
+
+mean_auc_umap <- mean(
+  auc_values_umap,
+  na.rm = TRUE
+)
+
+sd_auc_umap <- sd(
+  auc_values_umap,
+  na.rm = TRUE
+)
+
+cat(
+  "Repeated CV AUC =",
+  round(mean_auc_umap, 3),
+  "±",
+  round(sd_auc_umap, 3),
+  "\n"
+)
+
+
+# 11. Bootstrap stability selection
+
+set.seed(123)
+
+n_boot <- 200
+
+selection_matrix_umap <- matrix(
+  0,
+  nrow = n_boot,
+  ncol = ncol(x_umap),
+  dimnames = list(
+    NULL,
+    colnames(x_umap)
+  )
+)
+
+for(b in 1:n_boot){
+  # Stratified sampling: sample separately from each class
+  idx_0 <- which(y_umap == 0)
+  idx_1 <- which(y_umap == 1)
+  
+  # Sample all observations from class 0 and 1 (with replacement)
+  idx <- c(
+    sample(idx_0, size = length(idx_0), replace = TRUE),
+    sample(idx_1, size = length(idx_1), replace = TRUE)
+  )
+  
+  x_b <- x_umap[idx, ]
+  y_b <- y_umap[idx]
+  
+  # No need for min(table(y_b)) < 8 check, as we sampled all observations
+  fit_b <- cv.glmnet(
+    x_b,
+    y_b,
+    family = "binomial",
+    alpha = best_alpha_umap,
+    nfolds = 5,
+    standardize = TRUE
+  )
+  
+  coefs_b <- as.matrix(coef(fit_b, s = "lambda.1se"))[-1,1]
+  selection_matrix_umap[b, ] <- as.integer(coefs_b != 0)
+}
+
+stability_umap <- tibble(
+  variable = colnames(
+    selection_matrix_umap
+  ),
+  selection_frequency = colMeans(
+    selection_matrix_umap
+  )
+) %>%
+  arrange(desc(selection_frequency))
+
+print(stability_umap)
+
+
+# 12. Final selected variables
+
+
+final_umap <- selected_umap %>%
+  left_join(
+    stability_umap,
+    by = "variable"
+  ) %>%
+  arrange(
+    desc(selection_frequency),
+    desc(abs(coefficient))
+  )
+
+print(final_umap)
+
+
+# 13. Bootstrap selection frequency
+
+
+set.seed(123)
+n_boot_plot <- 200
+
+# Matrix to store selection indicators (1=selected, 0=not)
+selection_matrix <- matrix(
+  0,
+  nrow = n_boot_plot,
+  ncol = ncol(x_umap),
+  dimnames = list(NULL, colnames(x_umap))
+)
+
+for(b in 1:n_boot_plot){
+  # Stratified sampling: sample separately from each class
+  idx_0 <- which(y_umap == 0)
+  idx_1 <- which(y_umap == 1)
+  
+  # Sample all observations from each class (with replacement)
+  idx <- c(
+    sample(idx_0, size = length(idx_0), replace = TRUE),
+    sample(idx_1, size = length(idx_1), replace = TRUE)
+  )
+  
+  x_b <- x_umap[idx, ]
+  y_b <- y_umap[idx]
+  
+  # No need for min(table(y_b)) check, as we sampled all observations
+  fit_b <- cv.glmnet(
+    x_b,
+    y_b,
+    family = "binomial",
+    alpha = best_alpha_umap,
+    nfolds = 5,
+    standardize = TRUE
+  )
+  
+  coefs_b <- as.matrix(coef(fit_b, s = "lambda.1se"))[-1, 1]
+  selection_matrix[b, ] <- as.integer(coefs_b != 0)
+}
+
+# Calculate selection frequency
+selection_freq <- data.frame(
+  variable = colnames(selection_matrix),
+  selection_frequency = colMeans(selection_matrix, na.rm = TRUE)
+) %>%
+  arrange(desc(selection_frequency))
+
+
+# 14. Plot output
+
+
+# Merge selection frequency with coefficients
+plot_data <- selection_freq %>%
+  left_join(
+    coef_table_umap %>% select(variable, coefficient),
+    by = "variable"
+  ) %>%
+  mutate(
+    dot_size = ifelse(coefficient != 0, "non_zero", "zero")
+  )
+
+# Plot with two sizes and size legend
+graph1 <- ggplot(plot_data, aes(x = selection_frequency, y = reorder(variable, selection_frequency))) +
+  geom_point(aes(color = case_when(
+    selection_frequency < 0.5 ~ "gray", selection_frequency >= 0.5 ~ "red"), 
+    size = dot_size), alpha = 0.8) +
+  scale_color_manual(
+    values = c("gray" = "gray50", "orange" = "orange", "red" = "red"),
+    name = NULL
+  ) +
+  scale_size_manual(
+    values = c("non_zero" = 6.5, "zero" = 1.5),
+    name = "Coefficient"
+  ) +
+  guides(color = "none") +  # Hide color legend, show size legend only
+  labs(
+    title = "Most robust predictors of platelet-associated HIV RNA",
+    x = "Bootstrap Selection Frequency (AUC = 0.597 ± 0.058)",
+    y= ""
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 1, face = "bold", size = 12),
+    axis.text.y = element_text(size = 9, hjust = 1),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(linewidth = 0.5, linetype = "solid"),
+    axis.ticks = element_line(color = "black")
+  )
+
+print(graph1)
