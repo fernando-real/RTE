@@ -1,0 +1,202 @@
+# Script 4
+# Factor Analysis of Mixed Data (FAMD)
+# Purpose:  FAMD on UMAP‑derived frequencies or conjugates,
+#           MANOVA on first two dimensions, pairwise Wilcoxon tests,
+#           and variable vectors coloured by –log10 p for two panels:
+#
+# Input:    XLXS file with columns:
+# - PCRtest: grouping factor (positive versus negative for platelet-associated HIV RNA)
+# - status: grouping factor (responder and non-responders)
+# - status2: grouping factor (responder and non-responders, positive or negative for latelet-associated HIV RNA)
+# - _freq suffix variables : frequency of each cell subset identified by unsupervised method. (e.g: "UMAP_CD4memory_freq”)
+# - _conjugate suffix variables : frequency of platelet conjugates among each cell subset identified by #unsupervised method. (e.g: "UMAP_CD4memory_conjugate”)
+
+# 0. Load packages
+
+library(readxl)
+library(dplyr)
+library(mice)
+library(FactoMineR)
+library(factoextra)
+library(ggplot2)
+library(cowplot)
+library(gridExtra)
+library(grid)
+
+# 1. Load data
+
+data <- read_excel(“data.xlsx")
+
+# Convert categorical variables to factors
+
+data$status <- as.factor(data$status)
+data$status2 <- as.factor(data$status2)
+data$PCRtest <- as.factor(data$PCRtest)
+data$SEX <- as.factor(data$SEX)
+
+# Replace empty strings with NA and convert numeric columns
+numeric_cols <- c("AGE",
+"CLINICAL_LYMPHOCYTES_per_ul",
+"CLINICAL_CD4_per_ul",
+"CLINICAL_CD8_per_ul",
+"CLINICAL_CD4CD8_ratio",
+"CLINICAL_PLATELETS_per_ul",
+"FACS_CD4RTE",
+"FACS_CD4RTE_conjugatePT",
+"FACS_CD4",
+"FACS_CD4_conjugatePT",
+"FACS_CD8",
+"FACS_CD8_conjugatePT",
+"FACS_DN",
+"FACS_DN_conjugatePT",
+"UMAP_CD4effector_freq",
+"UMAP_CD4effector_conjugate",
+"UMAP_CD4memory_freq",
+"UMAP_CD4memory_conjugate",
+"UMAP_CD8effector_freq",
+"UMAP_CD8effector_conjugate",
+"UMAP_CD8memory_freq",
+"UMAP_CD8memory_conjugate",
+"UMAP_CD4naive_freq",
+"UMAP_CD4naive_conjugate",
+"UMAP_CD8naive_freq",
+"UMAP_CD8naive_conjugate")
+
+data[numeric_cols] <- lapply(data[numeric_cols], function(x) {
+  if (is.character(x)) {
+    x[x == ""] <- NA
+    as.numeric(x)
+  } else {
+    x
+  }
+})
+
+# Impute Missing Values Using `mice`
+set.seed(123)
+imputed_data <- mice(data, method = "pmm", m = 5, maxit = 50, printFlag = FALSE, seed = 123)
+imputed_data_complete <- complete(imputed_data)
+
+# 2. FAMD + stats (MANOVA, pairwise Wilcoxon) for a set of variables
+
+res.famd <- FAMD(imputed_data_complete, graph = FALSE)
+
+# Visualize FAMD Results by status2
+# Define color palette for status2 categories (adjust colors as needed)
+status2_palette <- c(
+  "1IRnegative" = "#56B4E9",
+  "2IRpositive" = "blue",
+  "3InRnegative" = "#E69F00",
+  "4InRpositive" = "red"
+)
+
+# Filter out rows with NA in status2 or coordinates
+coords <- as.data.frame(res.famd$ind$coord)
+coords$group <- imputed_data_complete$status2
+coords <- na.omit(coords)
+
+pca_plot <- fviz_mfa_ind(
+  res.famd,
+  habillage = "status2",  # Changed to status2
+  palette = status2_palette,
+  addEllipses = TRUE,
+  ellipse.type = "confidence",
+  repel = TRUE,
+  label = "none",
+  mean.point = FALSE
+) +
+  theme_classic() +
+  coord_fixed(ratio = 1) +
+  xlim(-8, 8) +
+  ylim(-8, 8) +
+  labs(title = "FAMD of Clinical Data (Colored by status2)")
+
+# MANOVA test
+fit <- manova(cbind(Dim.1, Dim.2) ~ group, data = coords)
+manova_summary <- summary(fit, test = "Wilks")
+
+# Pairwise Wilcoxon tests for dimensions
+dim1 <- pairwise.wilcox.test(coords$Dim.1, coords$group, p.adjust.method = "BH")
+dim2 <- pairwise.wilcox.test(coords$Dim.2, coords$group, p.adjust.method = "BH")
+
+# Prepare p-value tables
+dim1_df <- as.data.frame(as.table(dim1$p.value)) %>%
+  rename(group1 = Var1, group2 = Var2, pval_dim1 = Freq) %>%
+  filter(!is.na(pval_dim1))
+
+dim2_df <- as.data.frame(as.table(dim2$p.value)) %>%
+  rename(group1 = Var1, group2 = Var2, pval_dim2 = Freq) %>%
+  filter(!is.na(pval_dim2))
+
+combined_pvals <- inner_join(dim1_df, dim2_df, by = c("group1", "group2")) %>%
+  arrange(group1, group2)
+combined_pvals$pval_dim1 <- signif(combined_pvals$pval_dim1, 3)
+combined_pvals$pval_dim2 <- signif(combined_pvals$pval_dim2, 3)
+colnames(combined_pvals)[3:4] <- c("Wilcox p-val Dim 1", "Wilcox p-val Dim 2")
+
+pvals_grob <- tableGrob(combined_pvals, rows = NULL)
+
+# Combine PCA plot with stats table
+combined_pca_stats <- plot_grid(
+  pvals_grob, pca_plot,
+  nrow = 2, rel_heights = c(0.45, 0.55)
+)
+
+# Vector Plot with p-values (only p < 0.05)
+quanti_coords <- as.data.frame(res.famd$quanti.var$coord[, 1:2])
+quanti_coords$var <- rownames(quanti_coords)
+
+# Calculate p-values for each variable vs status2
+pvals_vec <- sapply(quanti_coords$var, function(v) {
+  y <- imputed_data_complete[[v]]
+  fit_aov <- aov(y ~ imputed_data_complete$status2)
+  summary(fit_aov)[[1]][["Pr(>F)"]][1]
+})
+quanti_coords$pval <- pvals_vec
+quanti_coords$neglog10p <- pmin(-log10(quanti_coords$pval), 10)
+
+# Filter for p-value < 0.05
+quanti_coords_filtered <- quanti_coords[quanti_coords$pval < 0.05, ]
+
+quanti_plot_p <- ggplot(quanti_coords_filtered, aes(color = neglog10p)) +
+  geom_segment(aes(x = 0, y = 0, xend = Dim.1, yend = Dim.2),
+               arrow = arrow(length = unit(0.3, "cm")), linewidth = 1) +
+  geom_text(aes(x = Dim.1, y = Dim.2, label = var),
+            hjust = 0, vjust = 0, size = 3, color = "black",
+            nudge_x = 0.02, nudge_y = 0.02) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "lightgrey") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "lightgrey") +
+  scale_color_viridis_c(name = "-log10(p)", option = "C", limits = c(1, 6), oob = scales::squish) +
+  theme_classic() +
+  coord_fixed(ratio = 1) +
+  xlim(-1, 1) +
+  ylim(-1, 1) +
+  xlab("Dim 1") + ylab("Dim 2") +
+  ggtitle("Quantitative variables (p < 0.05) colored by p value (vs status2)")
+
+# 3. Plot output
+
+plot_grid(
+  combined_pca_stats,
+  quanti_plot_p,
+  ncol = 1,
+  rel_widths = c(0.55, 0.45),
+  labels = c("A", "B")
+)
+
+combined_pca_stats
+quanti_plot_p
+
+quanti_plot_p2 <- ggplot(quanti_coords_filtered, aes(color = neglog10p)) +
+  geom_segment(aes(x = 0, y = 0, xend = Dim.1, yend = Dim.2),
+               arrow = arrow(length = unit(0.3, "cm")), linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "lightgrey") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "lightgrey") +
+  scale_color_viridis_c(name = "-log10(p)", option = "C", limits = c(1, 6), oob = scales::squish) +
+  theme_classic() +
+  coord_fixed(ratio = 1) +
+  xlim(-1, 01) +
+  ylim(-1, 1) +
+  xlab("Dim 1") + ylab("Dim 2") +
+  ggtitle("Quantitative variables (p < 0.05) colored by p value (vs status2)")
+
+quanti_plot_p2
