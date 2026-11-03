@@ -1,0 +1,147 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2907
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww12160\viewh18500\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 # Script 2\
+# Robust linear regression models \
+# Purpose:  Robust linear regression (MASS::rlm) of cell frequencies vs\
+#           conjugate percentages in PLWH positive or negative for platelet-associated HIV RNA,\
+#           per cell subset, with pseudo R^2 and facet plots.\
+#\
+# Input:    CSV with:\
+#           - cell      : cell subset (e.g. CD4effector, RTE CD4,\'85)\
+#           - status    : grouping factor (e.g. positive versus negative for platelet-associated HIV RNA)\
+#           - freq      : cell frequency (%)\
+#           - CD42b    : platelet conjugate (CD42b+) frequency (%)\
+\
+# 0. Load packages\
+\
+library(ggplot2)\
+library(dplyr)\
+library(readr)\
+library(MASS)\
+library(cowplot)\
+library(gridExtra)\
+library(broom)\
+\
+# 1. Load data\
+\
+df=data.csv\
+df <- df %>%\
+  filter(status %in% c("negative", "positive")) %>%\
+  droplevels()\
+\pard\tx593\pardeftab593\partightenfactor0
+\cf0 \
+# Ensure grouping and numeric\
+df$freq <- as.numeric(df$freq)\
+df$CD42b <- as.numeric(df$CD42b)\
+df$status <- factor(df$status, levels = c("negative", "positive"))\
+\
+# Restrict to only the desired cell panel\
+cells_of_interest <- c("CD4", "CD4naive", "CD4effector", "CD4memory", "RTECD4", "CD8", "CD8naive", "CD8effector", "CD8memory", "RTECD8")\
+df_panel <- df %>% filter(cell %in% cells_of_interest)\
+df_panel <- df_panel %>%\
+  mutate(cell = factor(cell, levels = cells_of_interest))\
+\
+# Identify and remove correlation outliers (points with large residuals)\
+df_panel <- df_panel %>%\
+  group_by(cell, status) %>%\
+  do(\{\
+    m <- try(rlm(freq ~ CD42b, data = .), silent = TRUE)\
+    if (inherits(m, "try-error")) \{\
+      .  # Keep all points if model fails\
+    \} else \{\
+      residuals <- residuals(m)\
+      mad_resid <- median(abs(residuals), na.rm = TRUE)\
+      .[abs(residuals) <= 2 * mad_resid, ]  # adjust points within 2 to 4 MAD of residuals\
+    \}\
+  \}) %>%\
+  ungroup()\
+\
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+\cf0 \
+# 2. Robust regression and R-square calculation \
+\
+r_squared_df_conj <- df_panel %>%\
+  group_by(cell, status) %>%\
+  do(\{\
+    m_rlm <- try(rlm(freq ~ CD42b, data = .), silent = TRUE)\
+    m_lm <- try(lm(freq ~ CD42b, data = .), silent = TRUE)  # For p-value extraction\
+    \
+    if (inherits(m_rlm, "try-error") || inherits(m_lm, "try-error")) \{\
+      data.frame(\
+        r_squared_robust = NA_real_,\
+        slope = NA_real_,\
+        p_value = NA_real_,\
+        x = max(.$CD42b, na.rm = TRUE),\
+        y = max(.$freq, na.rm = TRUE)\
+      )\
+    \} else \{\
+      rss <- sum(resid(m_rlm)^2)\
+      tss <- sum((.$freq - mean(.$freq, na.rm = TRUE))^2)\
+      r2_robust <- 1 - rss/tss\
+      slope <- coef(m_rlm)[2]  # Use rlm slope\
+      \
+      # Use lm for p-value\
+      p_value <- summary(m_lm)$coefficients[2, 4]\
+      \
+      data.frame(\
+        r_squared_robust = r2_robust,\
+        slope = slope,\
+        p_value = p_value,\
+        x = max(.$CD42b, na.rm = TRUE),\
+        y = max(.$freq, na.rm = TRUE)\
+      )\
+    \}\
+  \}) %>%\
+  ungroup()\
+\
+# 3. Plot with R-squared labeled\
+\
+pltCD42b <- ggplot(df_panel, aes(x = CD42b, y = freq, color = status)) +\
+  geom_point(alpha = 0.7) +\
+  geom_smooth(method = "lm", se = FALSE, fullrange = FALSE) +\
+  facet_wrap(~cell, scales = "free") +\
+  scale_color_manual(values = c("negative" = "lightblue", "positive" = "orange")) +\
+  labs(\
+    title = "Correlation of cell frequencies vs CD42b+ % with R\'b2 & slope",\
+    y = "Frequency (Cell frequency %)",\
+    x = "Conjugate (CD42b+ %)",\
+    color = "Group"\
+  ) +\
+  theme_classic() +\
+  theme(plot.title = element_text(hjust = 0.5))\
+print(pltCD42b)\
+\
+# Table WITH SLOPE AND P-VALUES\
+r_squared_df_conj_flat <- bind_rows(r_squared_df_conj)\
+r_square_table_conj <- r_squared_df_conj_flat[, c("cell", "status", "r_squared_robust", "slope", "p_value")]\
+r_square_table_conj <- r_square_table_conj[\
+  order(match(r_square_table_conj$cell, cells_of_interest),\
+        match(r_square_table_conj$status, c("negative", "positive"))),\
+]\
+\
+# Round for display (truncate R\'b2 at 0)\
+r_square_table_conj$r_squared_robust <- round(pmax(r_square_table_conj$r_squared_robust, 0), 3)\
+r_square_table_conj$slope <- round(r_square_table_conj$slope, 3)\
+\
+# Format p-values for readability (e.g., "< 0.05" or scientific notation)\
+r_square_table_conj$p_value <- ifelse(\
+  r_square_table_conj$p_value < 0.001,\
+  "< 0.001",\
+  round(r_square_table_conj$p_value, 4)\
+)\
+\
+# Create the table grob\
+table_grob_conj <- tableGrob(r_square_table_conj, rows = NULL, theme = ttheme_minimal())\
+\
+# Plot with table\
+plot_grid(pltCD42b, table_grob_conj, nrow = 1, rel_widths = c(1, 1.2))\
+\
+\
+\
+\
+}
